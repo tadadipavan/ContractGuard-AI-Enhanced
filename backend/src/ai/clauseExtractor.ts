@@ -1,0 +1,303 @@
+import { z } from 'zod';
+import { createLogger } from '../lib/logger.js';
+import { fetchWithTimeout, retryWithBackoff } from '../lib/timeout.js';
+import {
+    buildClauseExtractionPrompt,
+    buildDateExtractionPrompt,
+    buildContractTypePrompt,
+    CLAUSE_TYPES,
+    RISK_LEVELS,
+    type ExtractedClause,
+    type ExtractedDates,
+} from './prompts.js';
+
+const log = createLogger('ai.clauseExtractor');
+
+// ─── Configuration ────────────────────────────────────────────
+
+const GROQ_API_URL = 'https://api.groq.com/openai/v1/chat/completions';
+
+const GROQ_PRIMARY_MODEL = process.env.GROQ_MODEL ?? 'llama-3.1-8b-instant';
+const GROQ_FALLBACK_MODEL = 'llama-3.1-8b-instant';
+
+// Max context for clause extraction (keep room for response)
+const MAX_EXTRACT_CHARS = 12_000;
+const CHUNK_OVERLAP_CHARS = 500;
+const API_TIMEOUT_MS = 25_000;  // 25s per Groq call
+
+// ─── Zod Schemas ─────────────────────────────────────────────
+
+const ClauseSchema = z.object({
+    clause_type: z.enum(CLAUSE_TYPES),
+    text: z.string().min(1).max(5000),
+    risk_level: z.enum(RISK_LEVELS),
+    risk_explanation: z.string().min(1).max(500),
+    page_number: z.number().int().optional(),
+});
+
+const ClauseArraySchema = z.array(ClauseSchema);
+
+const DateSchema = z.object({
+    effective_date: z.string().nullable(),
+    expiration_date: z.string().nullable(),
+    auto_renewal: z.boolean(),
+    notice_period_days: z.number().nullable(),
+});
+
+const ContractTypeSchema = z.object({
+    type: z.enum(['NDA', 'MSA', 'SaaS', 'Vendor', 'Employment', 'Other']),
+    confidence: z.number().min(0).max(1),
+    counterparty: z.string().nullable(),
+});
+
+// ─── Main Entry Points ────────────────────────────────────────
+
+/**
+ * Extract all clauses from a contract using LLaMA 3.1 via Groq.
+ * Falls back to a lighter Groq model on failure.
+ *
+ * For large contracts, splits into overlapping windows and deduplicates results.
+ * Windows are processed in parallel with per-window retry + timeout.
+ */
+export async function extractClauses(contractText: string): Promise<ExtractedClause[]> {
+    log.info({ textLength: contractText.length }, 'Starting clause extraction');
+
+    const windows = splitIntoWindows(contractText, MAX_EXTRACT_CHARS, CHUNK_OVERLAP_CHARS);
+    log.debug({ windowCount: windows.length }, 'Processing contract windows');
+
+    // Process windows in parallel — each gets its own timeout + retry
+    const windowPromises = windows.map((windowText, i) =>
+        retryWithBackoff(
+            () => extractClausesFromWindow(windowText),
+            {
+                attempts: 2,
+                baseDelayMs: 2000,
+                timeoutMs: API_TIMEOUT_MS,
+                label: `Clause extraction window ${i + 1}/${windows.length}`,
+            },
+        ).catch((err) => {
+            log.error({ err, window: i + 1 }, 'Clause extraction failed for window — continuing');
+            return [] as ExtractedClause[];
+        }),
+    );
+
+    const windowResults = await Promise.all(windowPromises);
+    const allClauses: ExtractedClause[] = windowResults.flat();
+    const deduped = deduplicateClauses(allClauses);
+
+    log.info(
+        { totalClauses: allClauses.length, dedupedClauses: deduped.length },
+        'Clause extraction complete',
+    );
+
+    return deduped;
+}
+
+/**
+ * Extract key dates from a contract.
+ */
+export async function extractDates(contractText: string): Promise<ExtractedDates> {
+    const prompt = buildDateExtractionPrompt(contractText);
+
+    try {
+        const raw = await retryWithBackoff(
+            () => callGroqModel(prompt, GROQ_PRIMARY_MODEL),
+            {
+                attempts: 2,
+                baseDelayMs: 1000,
+                timeoutMs: API_TIMEOUT_MS,
+                label: 'Date extraction',
+            },
+        );
+        return parseJsonResponse(raw, DateSchema);
+    } catch (err) {
+        log.warn({ err }, 'Date extraction failed — returning nulls');
+        return {
+            effective_date: null,
+            expiration_date: null,
+            auto_renewal: false,
+            notice_period_days: null,
+        };
+    }
+}
+
+/**
+ * Detect contract type and counterparty.
+ */
+export async function detectContractType(contractText: string): Promise<{
+    type: string;
+    counterparty: string | null;
+}> {
+    const prompt = buildContractTypePrompt(contractText);
+
+    try {
+        const raw = await retryWithBackoff(
+            () => callGroqModel(prompt, GROQ_PRIMARY_MODEL),
+            {
+                attempts: 2,
+                baseDelayMs: 1000,
+                timeoutMs: API_TIMEOUT_MS,
+                label: 'Contract type detection',
+            },
+        );
+        const parsed = parseJsonResponse(raw, ContractTypeSchema);
+        return { type: parsed.type, counterparty: parsed.counterparty };
+    } catch (err) {
+        log.warn({ err }, 'Contract type detection failed — defaulting to Other');
+        return { type: 'Other', counterparty: null };
+    }
+}
+
+// ─── Internal: Single Window Extraction ──────────────────────
+
+async function extractClausesFromWindow(windowText: string): Promise<ExtractedClause[]> {
+    const prompt = buildClauseExtractionPrompt(windowText);
+
+    // Try primary model first, fall back if it fails
+    let raw: string;
+    try {
+        raw = await callGroqModel(prompt, GROQ_PRIMARY_MODEL);
+    } catch (err) {
+        if (GROQ_PRIMARY_MODEL === GROQ_FALLBACK_MODEL) throw err;
+
+        log.warn({ err, model: GROQ_PRIMARY_MODEL }, 'Primary model failed — trying fallback');
+        raw = await callGroqModel(prompt, GROQ_FALLBACK_MODEL);
+    }
+
+    const parsed = parseJsonResponse(raw, ClauseArraySchema);
+    log.debug({ clausesFound: parsed.length }, 'Window clauses extracted');
+    return parsed;
+}
+
+// ─── Groq API Caller ─────────────────────────────────────────
+
+async function callGroqModel(prompt: string, model: string): Promise<string> {
+    const apiKey = process.env.GROQ_API_KEY;
+    if (!apiKey) throw new Error('GROQ_API_KEY is not set');
+
+    log.debug({ model, promptLength: prompt.length }, 'Calling Groq API');
+
+    const response = await fetchWithTimeout(
+        GROQ_API_URL,
+        {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                Authorization: `Bearer ${apiKey}`,
+            },
+            body: JSON.stringify({
+                model,
+                messages: [
+                    {
+                        role: 'system',
+                        content: 'You are a legal contract analysis AI. Always respond with valid JSON only. No markdown, no explanation.',
+                    },
+                    { role: 'user', content: prompt },
+                ],
+                temperature: 0.1,      // Low temp for consistency
+                max_tokens: 4096,
+                response_format: { type: 'json_object' },
+            }),
+        },
+        API_TIMEOUT_MS,
+    );
+
+    if (!response.ok) {
+        const body = await response.text();
+        throw new Error(`Groq API error (${model}) ${response.status}: ${body}`);
+    }
+
+    const data = await response.json() as {
+        choices: Array<{ message: { content: string } }>;
+    };
+
+    const content = data.choices[0]?.message?.content;
+    if (!content) throw new Error(`Groq model ${model} returned empty response`);
+
+    log.debug({ model, contentLength: content.length }, 'Groq API response received');
+    return content;
+}
+
+// ─── Helpers ─────────────────────────────────────────────────
+
+function parseJsonResponse<T>(raw: string, schema: z.ZodSchema<T>): T {
+    // Strip markdown fences if present (some models ignore the instruction)
+    const cleaned = raw
+        .replace(/^```json\s*/i, '')
+        .replace(/^```\s*/i, '')
+        .replace(/\s*```$/i, '')
+        .trim();
+
+    let parsed: unknown;
+    try {
+        parsed = JSON.parse(cleaned);
+    } catch {
+        // Try to extract JSON from response
+        const jsonMatch = cleaned.match(/[\[{][\s\S]*[\]}]/);
+        if (!jsonMatch) throw new Error(`No valid JSON found in LLM response: ${cleaned.slice(0, 200)}`);
+        parsed = JSON.parse(jsonMatch[0]);
+    }
+
+    // Handle both array and wrapped object responses
+    // e.g. { "clauses": [...] } → extract the array
+    if (!Array.isArray(parsed) && typeof parsed === 'object' && parsed !== null) {
+        const values = Object.values(parsed);
+        if (values.length === 1 && Array.isArray(values[0])) {
+            parsed = values[0];
+        }
+    }
+
+    return schema.parse(parsed);
+}
+
+function splitIntoWindows(text: string, maxChars: number, overlap: number): string[] {
+    if (text.length <= maxChars) return [text];
+
+    const windows: string[] = [];
+    let start = 0;
+
+    while (start < text.length) {
+        const end = Math.min(start + maxChars, text.length);
+        windows.push(text.slice(start, end));
+
+        if (end === text.length) break;
+        start = end - overlap;
+    }
+
+    return windows;
+}
+
+const RISK_ORDER: Record<string, number> = {
+    critical: 4, high: 3, medium: 2, low: 1,
+};
+
+function deduplicateClauses(clauses: ExtractedClause[]): ExtractedClause[] {
+    const byType = new Map<string, ExtractedClause[]>();
+
+    for (const clause of clauses) {
+        const existing = byType.get(clause.clause_type) ?? [];
+        existing.push(clause);
+        byType.set(clause.clause_type, existing);
+    }
+
+    // For each type, sort by risk level desc and take the top (but keep multiple
+    // clauses of the same type if risk levels differ — e.g., 2 liability clauses
+    // one critical and one low are both meaningful)
+    const result: ExtractedClause[] = [];
+    for (const [, typeClauses] of byType) {
+        const sorted = typeClauses.sort(
+            (a, b) => (RISK_ORDER[b.risk_level] ?? 0) - (RISK_ORDER[a.risk_level] ?? 0),
+        );
+        // Deduplicate by near-identical text (same first 100 chars)
+        const seen = new Set<string>();
+        for (const clause of sorted) {
+            const key = clause.text.slice(0, 100).trim();
+            if (!seen.has(key)) {
+                seen.add(key);
+                result.push(clause);
+            }
+        }
+    }
+
+    return result;
+}
